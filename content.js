@@ -36,11 +36,20 @@
   }
 
   function loadComments(cb) {
-    chrome.storage.local.get(STORAGE_KEY, (data) => cb(data[STORAGE_KEY] || []));
+    if (chrome?.storage?.local) {
+      chrome.storage.local.get(STORAGE_KEY, (data) => cb(data[STORAGE_KEY] || []));
+    } else {
+      try { cb(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')); }
+      catch { cb([]); }
+    }
   }
 
   function saveComments(comments) {
-    chrome.storage.local.set({ [STORAGE_KEY]: comments });
+    if (chrome?.storage?.local) {
+      chrome.storage.local.set({ [STORAGE_KEY]: comments });
+    } else {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(comments));
+    }
   }
 
   function pageComments(all) {
