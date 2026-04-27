@@ -93,50 +93,27 @@
     return data.filter(c => c.body.includes(MARKER)).map(parseGitHubComment).filter(Boolean);
   }
 
-  // Post via a real form.submit() into a hidden iframe — the only way to send
-  // SameSite=Strict session cookies from an extension content script.
+  // Delegate the actual fetch to the background worker, which re-injects it
+  // into the page's MAIN world. That makes the browser treat it as same-origin,
+  // so SameSite=Strict session cookies are included — unlike a direct fetch()
+  // from a content script, which Chrome considers cross-context.
   async function postComment(comment) {
     const { owner, repo, number } = prInfo;
     const csrf = getVerifiedCsrfToken();
     if (!csrf) throw new Error('CSRF token not found — are you logged in to GitHub?');
 
-    const frameName = 'prmc-frame-' + Math.random().toString(36).slice(2);
-    const iframe = Object.assign(document.createElement('iframe'), { name: frameName });
-    iframe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none';
-
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = `https://github.com/${owner}/${repo}/issues/${number}/comments`;
-    form.target = frameName;
-    form.style.display = 'none';
-
-    for (const [name, value] of [
-      ['utf8', '✓'],
-      ['authenticity_token', csrf],
-      ['comment[body]', buildCommentBody(comment)],
-    ]) {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = name;
-      input.value = value;
-      form.appendChild(input);
-    }
-
-    // Append iframe first so it's a valid target frame, then add load listener,
-    // then submit form (avoids about:blank load-event race on some browsers).
-    document.body.appendChild(iframe);
-    document.body.appendChild(form);
-
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const done = (fn) => (...args) => { if (!settled) { settled = true; fn(...args); } };
-      const timeout = setTimeout(done(reject.bind(null, new Error('Comment submission timed out'))), 12_000);
-      iframe.addEventListener('load', done(() => { clearTimeout(timeout); resolve(); }), { once: true });
-      form.submit();
+    const response = await chrome.runtime.sendMessage({
+      type: 'PRMC_POST_COMMENT',
+      owner, repo, number, csrf,
+      body: buildCommentBody(comment),
     });
 
-    form.remove();
-    iframe.remove();
+    if (!response?.success) {
+      throw new Error(response?.error || 'Extension background did not respond');
+    }
+    if (!response.result?.ok) {
+      throw new Error(`GitHub returned ${response.result?.status} — check that you are logged in`);
+    }
 
     // Poll api.github.com until our new comment appears (up to ~5s)
     const posted = Date.now();
@@ -159,38 +136,10 @@
     const csrf = getVerifiedCsrfToken();
     if (!csrf) return;
 
-    const frameName = 'prmc-del-' + Math.random().toString(36).slice(2);
-    const iframe = Object.assign(document.createElement('iframe'), { name: frameName });
-    iframe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none';
-
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = `https://github.com/${owner}/${repo}/issues/comments/${githubCommentId}`;
-    form.target = frameName;
-    form.style.display = 'none';
-
-    for (const [name, value] of [
-      ['utf8', '✓'],
-      ['authenticity_token', csrf],
-      ['_method', 'delete'],
-    ]) {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = name;
-      input.value = value;
-      form.appendChild(input);
-    }
-
-    document.body.appendChild(iframe);
-    document.body.appendChild(form);
-    await new Promise(resolve => {
-      let done = false;
-      iframe.addEventListener('load', () => { if (!done) { done = true; resolve(); } }, { once: true });
-      setTimeout(() => { if (!done) { done = true; resolve(); } }, 6000);
-      form.submit();
+    await chrome.runtime.sendMessage({
+      type: 'PRMC_DELETE_COMMENT',
+      owner, repo, commentId: githubCommentId, csrf,
     });
-    form.remove();
-    iframe.remove();
   }
 
   // ── In-memory state ────────────────────────────────────────────────────────

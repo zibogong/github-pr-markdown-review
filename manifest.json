@@ -3,7 +3,7 @@
   "name": "GitHub PR Markdown Commenter",
   "version": "1.0.0",
   "description": "Select text in GitHub PR rich diffs and add inline comments, Google Docs-style.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "scripting"],
   "host_permissions": [
     "https://github.com/*",
     "https://api.github.com/*"
