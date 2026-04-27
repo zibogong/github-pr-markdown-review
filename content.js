@@ -11,44 +11,10 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
-  // Make API calls directly from the content script so the request Origin is
-  // https://github.com — the same origin GitHub's own SPA uses. The browser
-  // includes the existing github.com session cookies automatically via
-  // credentials: 'include', so no token entry is required.
-  async function ghFetch(method, path, body) {
-    let res;
-    try {
-      res = await fetch(`https://api.github.com${path}`, {
-        method,
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/vnd.github+json',
-          'X-GitHub-Api-Version': '2022-11-28',
-        },
-        ...(body !== undefined && { body: JSON.stringify(body) }),
-      });
-    } catch (networkErr) {
-      // CORS or network failure — fall back to stored PAT
-      return ghFetchWithToken(method, path, body);
-    }
-
-    if (res.status === 401) {
-      // Session cookies weren't accepted — try stored PAT
-      return ghFetchWithToken(method, path, body);
-    }
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`GitHub API ${res.status}: ${text}`);
-    }
-    if (res.status === 204 || method === 'DELETE') return null;
-    return res.json();
-  }
-
-  // Fallback: use a stored PAT (or prompt for one).
-  function ghFetchWithToken(method, path, body) {
+  // All API calls go through the background worker which holds the OAuth token.
+  function ghFetch(method, path, body) {
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, (result) => {
+      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, result => {
         if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
         if (result?._error) {
           const err = new Error(result._error);
@@ -60,8 +26,14 @@
     });
   }
 
-  function setToken(token) {
-    return new Promise(resolve => chrome.runtime.sendMessage({ type: 'set_token', token }, resolve));
+  function launchOAuth() {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'launch_oauth' }, result => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (result?._error) return reject(Object.assign(new Error(result._error), { code: result._code }));
+        resolve();
+      });
+    });
   }
 
   function buildCommentBody(comment) {
@@ -351,7 +323,9 @@
       }, 50);
     } catch (e) {
       if (e.code === 'no_token' || e.code === 'invalid_token') {
-        showTokenPrompt(e.code === 'invalid_token' ? e.message : null, comment);
+        showLoginPrompt(e.code === 'invalid_token' ? e.message : null, comment);
+      } else if (e.code === 'not_configured') {
+        showError('Set CLIENT_ID and CLIENT_SECRET in background.js first (see setup instructions).');
       } else {
         console.error('[prmc] Failed to post comment:', e);
         showError('Could not post comment: ' + e.message);
@@ -359,40 +333,42 @@
     }
   }
 
-  function showTokenPrompt(errorMsg, pendingComment) {
+  function showLoginPrompt(errorMsg, pendingComment) {
     if (document.getElementById('prmc-token-modal')) return;
 
     const overlay = document.createElement('div');
     overlay.id = 'prmc-token-modal';
     overlay.innerHTML = `
       <div id="prmc-token-dialog">
-        <h3>GitHub Token Required</h3>
+        <h3>Connect GitHub</h3>
         ${errorMsg ? `<p class="prmc-token-error">${escapeHtml(errorMsg)}</p>` : ''}
-        <p>Create a <a href="https://github.com/settings/tokens/new?scopes=repo&description=PR+Markdown+Commenter" target="_blank">Personal Access Token</a> with <code>repo</code> scope, then paste it below.</p>
-        <input id="prmc-token-input" type="password" placeholder="ghp_…" autocomplete="off" spellcheck="false">
-        <div id="prmc-token-buttons">
-          <button id="prmc-token-cancel">Cancel</button>
-          <button id="prmc-token-save">Save &amp; post</button>
-        </div>
+        <p>Sign in once to post and view comments from all reviewers.</p>
+        <button id="prmc-oauth-btn">
+          <svg width="16" height="16" viewBox="0 0 16 16" style="vertical-align:middle;margin-right:6px" fill="currentColor">
+            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+          </svg>
+          Login with GitHub
+        </button>
+        <button id="prmc-token-cancel">Cancel</button>
       </div>`;
     document.body.appendChild(overlay);
 
-    const input = overlay.querySelector('#prmc-token-input');
-    input.focus();
+    overlay.querySelector('#prmc-oauth-btn').addEventListener('click', async () => {
+      const btn = overlay.querySelector('#prmc-oauth-btn');
+      btn.disabled = true;
+      btn.textContent = 'Opening GitHub…';
+      try {
+        await launchOAuth();
+        overlay.remove();
+        if (pendingComment) addComment(pendingComment);
+      } catch (e) {
+        showError('Login failed: ' + e.message);
+        overlay.remove();
+      }
+    });
 
     overlay.querySelector('#prmc-token-cancel').addEventListener('click', () => overlay.remove());
-    overlay.querySelector('#prmc-token-save').addEventListener('click', async () => {
-      const token = input.value.trim();
-      if (!token) { input.focus(); return; }
-      await setToken(token);
-      overlay.remove();
-      if (pendingComment) addComment(pendingComment);
-    });
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') overlay.querySelector('#prmc-token-save').click();
-      if (e.key === 'Escape') overlay.remove();
-    });
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
   }
 
   async function removeComment(comment) {

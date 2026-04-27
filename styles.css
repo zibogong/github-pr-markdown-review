@@ -289,35 +289,40 @@
 
 #prmc-token-input:focus { border-color: #0969da; box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.15); }
 
-#prmc-token-buttons {
+#prmc-oauth-btn {
   display: flex;
-  justify-content: flex-end;
-  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 9px 16px;
+  margin-bottom: 8px;
+  background: #24292f;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  font-weight: 500;
 }
 
-#prmc-token-buttons button {
-  padding: 6px 14px;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-  font-family: inherit;
-}
+#prmc-oauth-btn:hover { background: #32383f; }
+#prmc-oauth-btn:disabled { opacity: 0.6; cursor: default; }
 
 #prmc-token-cancel {
+  display: block;
+  width: 100%;
+  padding: 7px;
   background: #f6f8fa;
   border: 1px solid #d0d7de;
-  color: #24292f;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  color: #57606a;
 }
 
 #prmc-token-cancel:hover { background: #e9ebec; }
-
-#prmc-token-save {
-  background: #1a7f37;
-  border: 1px solid rgba(31, 35, 40, 0.15);
-  color: #fff;
-}
-
-#prmc-token-save:hover { background: #1a7f37cc; }
 
 /* ── Text highlights ─────────────────────────────────────────────────────── */
 mark.prmc-highlight {
