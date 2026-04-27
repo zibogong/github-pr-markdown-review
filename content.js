@@ -20,7 +20,28 @@
   // Reads:  GET from api.github.com — no auth required for public repos.
 
   function getCsrfToken() {
-    return document.querySelector('meta[name="csrf-token"]')?.content;
+    // GitHub puts the CSRF token in several places depending on the page state.
+    // Try them all, most specific first.
+    return (
+      document.querySelector('meta[name="csrf-token"]')?.content ||
+      document.querySelector('meta[name="user-csrf-token"]')?.content ||
+      document.querySelector('input[name="authenticity_token"]')?.value ||
+      document.querySelector('[data-csrf]')?.dataset.csrf ||
+      document.querySelector('[data-authenticity-token]')?.dataset.authenticityToken ||
+      // Inline review comment forms on the Files tab always have one
+      document.querySelector('form[action*="comments"] input[name="authenticity_token"]')?.value
+    );
+  }
+
+  // Log which token source we find so we can debug if it's still missing.
+  function getVerifiedCsrfToken() {
+    const token = getCsrfToken();
+    if (!token) {
+      // Dump all meta names to the console to help diagnose
+      const metas = [...document.querySelectorAll('meta[name]')].map(m => m.name).join(', ');
+      console.warn('[prmc] CSRF token not found. Meta tags on page:', metas);
+    }
+    return token;
   }
 
   function buildCommentBody(comment) {
@@ -77,7 +98,7 @@
   // GitHub's own Submit button. Returns the new GitHub comment ID.
   async function postComment(comment) {
     const { owner, repo, number } = prInfo;
-    const csrf = getCsrfToken();
+    const csrf = getVerifiedCsrfToken();
     if (!csrf) throw new Error('CSRF token not found — are you logged in to GitHub?');
 
     const res = await fetch(`https://github.com/${owner}/${repo}/issues/${number}/comments`, {
@@ -116,7 +137,7 @@
   async function deleteGhComment(githubCommentId) {
     if (!githubCommentId) return;
     const { owner, repo } = prInfo;
-    const csrf = getCsrfToken();
+    const csrf = getVerifiedCsrfToken();
     // GitHub's web UI deletes via a DELETE request to the comment URL
     await fetch(`https://github.com/${owner}/${repo}/issues/comments/${githubCommentId}`, {
       method: 'DELETE',
