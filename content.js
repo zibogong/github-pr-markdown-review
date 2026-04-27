@@ -11,9 +11,15 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
+  // Read the session token GitHub embeds in every page for its own API calls.
+  function getPageToken() {
+    return document.querySelector('meta[name="user-csrf-token"]')?.content;
+  }
+
   function ghFetch(method, path, body) {
+    const pageToken = getPageToken();
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, (result) => {
+      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body, pageToken }, (result) => {
         if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
         if (result?._error) {
           const err = new Error(result._error);
