@@ -11,24 +11,15 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
-  async function ghFetch(method, path, body) {
-    const res = await fetch(`https://api.github.com${path}`, {
-      method,
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      ...(body !== undefined && { body: JSON.stringify(body) }),
+  // Proxy through background service worker to bypass CORS on api.github.com
+  function ghFetch(method, path, body) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, (result) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (result?._error) return reject(new Error(result._error));
+        resolve(result);
+      });
     });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw Object.assign(new Error(`GitHub API ${res.status}`), { status: res.status, body: text });
-    }
-    if (res.status === 204 || method === 'DELETE') return null;
-    return res.json();
   }
 
   function buildCommentBody(comment) {
