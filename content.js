@@ -56,6 +56,7 @@
 
     sidebar = document.createElement('div');
     sidebar.id = 'prmc-sidebar';
+    sidebar.classList.add('prmc-hidden');
     sidebar.innerHTML = `
       <div id="prmc-sidebar-header">
         <span>PR Comments</span>
@@ -229,6 +230,7 @@
       saveComments(updated);
       applyHighlight(comment);
       renderSidebar(updated);
+      openBtn.classList.remove('prmc-hidden');
       openSidebar();
     });
   }
@@ -239,6 +241,10 @@
       saveComments(updated);
       removeHighlight(id);
       renderSidebar(updated);
+      if (pageComments(updated).length === 0) {
+        closeSidebar();
+        openBtn.classList.add('prmc-hidden');
+      }
     });
   }
 
@@ -316,10 +322,13 @@
   // ── Init rich diff layer ───────────────────────────────────────────────────
 
   function initCommentLayer(article) {
-    // Load and apply existing highlights
+    // Load and apply existing highlights; show open button only if there are comments
     loadComments(all => {
       renderSidebar(all);
       pageComments(all).forEach(applyHighlight);
+      if (pageComments(all).length > 0) {
+        openBtn.classList.remove('prmc-hidden');
+      }
     });
 
     // Listen for text selection within the article
