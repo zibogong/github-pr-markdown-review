@@ -1,8 +1,103 @@
 (() => {
   'use strict';
 
-  const STORAGE_KEY = 'prmc_comments';
-  const prUrl = location.href.split('?')[0].replace(/#.*$/, '');
+  // ── GitHub API layer ───────────────────────────────────────────────────────
+
+  function getPrInfo() {
+    const m = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    return m ? { owner: m[1], repo: m[2], number: parseInt(m[3]) } : null;
+  }
+
+  const prInfo = getPrInfo();
+  const MARKER = '<!-- prmc:';
+
+  async function ghFetch(method, path, body) {
+    const res = await fetch(`https://api.github.com${path}`, {
+      method,
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      ...(body !== undefined && { body: JSON.stringify(body) }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw Object.assign(new Error(`GitHub API ${res.status}`), { status: res.status, body: text });
+    }
+    if (res.status === 204 || method === 'DELETE') return null;
+    return res.json();
+  }
+
+  function buildCommentBody(comment) {
+    const meta = JSON.stringify({
+      quote: comment.quote,
+      elementXPath: comment.elementXPath,
+      startOffset: comment.startOffset,
+      endOffset: comment.endOffset,
+    });
+    const quoteLine = comment.quote
+      ? `> ${comment.quote.slice(0, 300).replace(/\n/g, '\n> ')}\n\n`
+      : '';
+    return `${quoteLine}${comment.commentText || ''}\n\n${MARKER}${meta} -->`;
+  }
+
+  function parseGitHubComment(c) {
+    const metaMatch = c.body.match(/<!-- prmc:(\{.*?\}) -->/s);
+    if (!metaMatch) return null;
+    try {
+      const meta = JSON.parse(metaMatch[1]);
+      const commentText = c.body
+        .replace(/\n\n<!-- prmc:.*? -->/s, '')
+        .replace(/^(> [^\n]*\n)+\n/, '')
+        .trim();
+      return {
+        id: String(c.id),
+        githubCommentId: c.id,
+        quote: meta.quote || '',
+        elementXPath: meta.elementXPath,
+        startOffset: meta.startOffset,
+        endOffset: meta.endOffset,
+        commentText,
+        timestamp: new Date(c.created_at).getTime(),
+        author: c.user.login,
+        avatarUrl: c.user.avatar_url,
+      };
+    } catch { return null; }
+  }
+
+  async function fetchPageComments() {
+    if (!prInfo) return [];
+    const { owner, repo, number } = prInfo;
+    const data = await ghFetch('GET', `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`);
+    return data.filter(c => c.body.includes(MARKER)).map(parseGitHubComment).filter(Boolean);
+  }
+
+  async function postComment(comment) {
+    const { owner, repo, number } = prInfo;
+    const res = await ghFetch('POST', `/repos/${owner}/${repo}/issues/${number}/comments`, {
+      body: buildCommentBody(comment),
+    });
+    return res.id;
+  }
+
+  async function patchComment(githubCommentId, comment) {
+    const { owner, repo } = prInfo;
+    await ghFetch('PATCH', `/repos/${owner}/${repo}/issues/comments/${githubCommentId}`, {
+      body: buildCommentBody(comment),
+    });
+  }
+
+  async function deleteGhComment(githubCommentId) {
+    const { owner, repo } = prInfo;
+    await ghFetch('DELETE', `/repos/${owner}/${repo}/issues/comments/${githubCommentId}`);
+  }
+
+  // ── In-memory state ────────────────────────────────────────────────────────
+
+  let activeComments = [];
 
   // ── Utilities ──────────────────────────────────────────────────────────────
 
@@ -24,36 +119,17 @@
 
   function resolveXPath(xpath) {
     try {
-      const result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-      return result.singleNodeValue;
-    } catch {
-      return null;
-    }
+      return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+    } catch { return null; }
   }
 
   function formatDate(ts) {
     return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
-  function loadComments(cb) {
-    if (chrome?.storage?.local) {
-      chrome.storage.local.get(STORAGE_KEY, (data) => cb(data[STORAGE_KEY] || []));
-    } else {
-      try { cb(JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]')); }
-      catch { cb([]); }
-    }
-  }
-
-  function saveComments(comments) {
-    if (chrome?.storage?.local) {
-      chrome.storage.local.set({ [STORAGE_KEY]: comments });
-    } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(comments));
-    }
-  }
-
-  function pageComments(all) {
-    return all.filter(c => c.prUrl === prUrl);
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   // ── Sidebar ────────────────────────────────────────────────────────────────
@@ -80,7 +156,6 @@
     openBtn = document.createElement('button');
     openBtn.id = 'prmc-open-btn';
     openBtn.textContent = 'Comments';
-    openBtn.title = 'Open comments panel';
     openBtn.classList.add('prmc-hidden');
     openBtn.addEventListener('click', openSidebar);
     document.body.appendChild(openBtn);
@@ -100,56 +175,62 @@
 
   function renderSidebar(comments) {
     sidebarList.innerHTML = '';
-    const mine = pageComments(comments);
-    if (mine.length === 0) {
+    if (comments.length === 0) {
       sidebarList.innerHTML = '<div id="prmc-sidebar-empty">No comments yet.<br>Select text in the rich diff to add one.</div>';
       return;
     }
-    // Sort by vertical position of anchor element
-    const sorted = mine.slice().sort((a, b) => {
-      const ea = resolveXPath(a.elementXPath);
-      const eb = resolveXPath(b.elementXPath);
-      const ya = ea ? ea.getBoundingClientRect().top : 0;
-      const yb = eb ? eb.getBoundingClientRect().top : 0;
+    const sorted = comments.slice().sort((a, b) => {
+      const ya = resolveXPath(a.elementXPath)?.getBoundingClientRect().top ?? 0;
+      const yb = resolveXPath(b.elementXPath)?.getBoundingClientRect().top ?? 0;
       return ya - yb;
     });
-    sorted.forEach(c => sidebarList.appendChild(buildCard(c, comments)));
+    sorted.forEach(c => sidebarList.appendChild(buildCard(c)));
   }
 
-  function buildCard(comment, allComments) {
+  const updateTimers = {};
+
+  function buildCard(comment) {
     const card = document.createElement('div');
     card.className = 'prmc-comment-card';
     card.dataset.commentId = comment.id;
 
     const anchorExists = !!resolveXPath(comment.elementXPath);
     const quoteClass = anchorExists ? 'prmc-comment-quote' : 'prmc-comment-quote prmc-lost';
-    const quoteTitle = anchorExists ? comment.quote : '(anchor lost — content may have changed)';
+    const quoteText = anchorExists ? comment.quote : '(anchor lost — content may have changed)';
 
     card.innerHTML = `
-      <div class="${quoteClass}" title="${escapeHtml(comment.quote)}">${escapeHtml(quoteTitle.slice(0, 120))}</div>
+      <div class="prmc-comment-meta">
+        <img class="prmc-avatar" src="${escapeHtml(comment.avatarUrl)}" alt="">
+        <a class="prmc-author" href="https://github.com/${escapeHtml(comment.author)}" target="_blank">${escapeHtml(comment.author)}</a>
+        <span class="prmc-date">${formatDate(comment.timestamp)}</span>
+      </div>
+      <div class="${quoteClass}" title="${escapeHtml(comment.quote)}">${escapeHtml(quoteText.slice(0, 120))}</div>
       <textarea class="prmc-comment-body" placeholder="Add a comment…">${escapeHtml(comment.commentText || '')}</textarea>
       <div class="prmc-comment-footer">
-        <span>${formatDate(comment.timestamp)}</span>
-        <button class="prmc-comment-delete" data-id="${comment.id}">Delete</button>
+        <span class="prmc-save-status"></span>
+        <button class="prmc-comment-delete">Delete</button>
       </div>`;
 
-    // Save comment text on blur
-    card.querySelector('.prmc-comment-body').addEventListener('blur', (e) => {
-      loadComments(all => {
-        const idx = all.findIndex(c => c.id === comment.id);
-        if (idx !== -1) {
-          all[idx].commentText = e.target.value;
-          saveComments(all);
+    const textarea = card.querySelector('.prmc-comment-body');
+    const statusEl = card.querySelector('.prmc-save-status');
+
+    textarea.addEventListener('input', () => {
+      clearTimeout(updateTimers[comment.id]);
+      statusEl.textContent = 'Saving…';
+      updateTimers[comment.id] = setTimeout(async () => {
+        comment.commentText = textarea.value;
+        try {
+          await patchComment(comment.githubCommentId, comment);
+          statusEl.textContent = 'Saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2000);
+        } catch {
+          statusEl.textContent = 'Save failed';
         }
-      });
+      }, 1000);
     });
 
-    // Delete
-    card.querySelector('.prmc-comment-delete').addEventListener('click', () => {
-      removeComment(comment.id);
-    });
+    card.querySelector('.prmc-comment-delete').addEventListener('click', () => removeComment(comment));
 
-    // Click card → highlight the mark
     card.addEventListener('click', (e) => {
       if (e.target.classList.contains('prmc-comment-delete') || e.target.tagName === 'TEXTAREA') return;
       const mark = document.querySelector(`mark.prmc-highlight[data-comment-id="${comment.id}"]`);
@@ -163,24 +244,14 @@
     return card;
   }
 
-  function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
-
   // ── Highlights ─────────────────────────────────────────────────────────────
 
   function applyHighlight(comment) {
     const anchor = resolveXPath(comment.elementXPath);
     if (!anchor) return;
 
-    // Walk text nodes within anchor to find startOffset/endOffset
     const walker = document.createTreeWalker(anchor, NodeFilter.SHOW_TEXT);
-    let charCount = 0;
-    let startNode = null, endNode = null, startOff = 0, endOff = 0;
+    let charCount = 0, startNode = null, endNode = null, startOff = 0, endOff = 0;
 
     while (walker.nextNode()) {
       const node = walker.currentNode;
@@ -207,7 +278,7 @@
       const mark = document.createElement('mark');
       mark.className = 'prmc-highlight';
       mark.dataset.commentId = comment.id;
-      mark.title = comment.commentText || '(no comment yet)';
+      mark.title = comment.commentText || '';
       mark.addEventListener('click', () => {
         openSidebar();
         const card = sidebarList.querySelector(`.prmc-comment-card[data-comment-id="${comment.id}"]`);
@@ -218,9 +289,7 @@
         }
       });
       range.surroundContents(mark);
-    } catch {
-      // Range spans multiple elements — skip highlight, comment still shows in sidebar
-    }
+    } catch { /* range spans elements — sidebar still shows the comment */ }
   }
 
   function removeHighlight(commentId) {
@@ -233,28 +302,44 @@
 
   // ── Comment CRUD ───────────────────────────────────────────────────────────
 
-  function addComment(comment) {
-    loadComments(all => {
-      const updated = [...all, comment];
-      saveComments(updated);
+  async function addComment(comment) {
+    try {
+      const githubId = await postComment(comment);
+      comment.id = String(githubId);
+      comment.githubCommentId = githubId;
+      activeComments.push(comment);
       applyHighlight(comment);
-      renderSidebar(updated);
+      renderSidebar(activeComments);
       openBtn.classList.remove('prmc-hidden');
       openSidebar();
-    });
+      setTimeout(() => {
+        const card = sidebarList.querySelector(`.prmc-comment-card[data-comment-id="${comment.id}"]`);
+        if (card) card.querySelector('textarea').focus();
+      }, 50);
+    } catch (e) {
+      console.error('[prmc] Failed to post comment:', e);
+      showError('Could not post comment. Are you logged in to GitHub?');
+    }
   }
 
-  function removeComment(id) {
-    loadComments(all => {
-      const updated = all.filter(c => c.id !== id);
-      saveComments(updated);
-      removeHighlight(id);
-      renderSidebar(updated);
-      if (pageComments(updated).length === 0) {
-        closeSidebar();
-        openBtn.classList.add('prmc-hidden');
-      }
-    });
+  async function removeComment(comment) {
+    removeHighlight(comment.id);
+    activeComments = activeComments.filter(c => c.id !== comment.id);
+    renderSidebar(activeComments);
+    if (activeComments.length === 0) { closeSidebar(); openBtn.classList.add('prmc-hidden'); }
+    try {
+      await deleteGhComment(comment.githubCommentId);
+    } catch (e) {
+      console.error('[prmc] Failed to delete comment:', e);
+    }
+  }
+
+  function showError(msg) {
+    const el = document.createElement('div');
+    el.style.cssText = 'position:fixed;bottom:16px;right:16px;background:#cf222e;color:#fff;padding:10px 14px;border-radius:6px;font-size:13px;z-index:99999;font-family:sans-serif';
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 5000);
   }
 
   // ── Floating "Add comment" button ──────────────────────────────────────────
@@ -267,28 +352,20 @@
       addBtn = document.createElement('button');
       addBtn.id = 'prmc-add-btn';
       addBtn.textContent = '💬 Comment';
-      addBtn.addEventListener('mousedown', (e) => {
-        e.preventDefault(); // prevent selection loss
-      });
+      addBtn.addEventListener('mousedown', e => e.preventDefault());
       addBtn.addEventListener('click', () => {
         hideAddBtn();
         if (!pendingRange) return;
 
-        const sel = window.getSelection();
         const selectedText = pendingRange.toString().trim();
         if (!selectedText) return;
 
         const anchorNode = pendingRange.commonAncestorContainer;
         const anchorEl = anchorNode.nodeType === Node.TEXT_NODE ? anchorNode.parentNode : anchorNode;
-
-        // Compute offsets relative to all text in the anchor element
-        const fullText = anchorEl.textContent;
         const xpath = getXPath(anchorEl);
 
-        // Walk text nodes to find absolute offsets
         const walker = document.createTreeWalker(anchorEl, NodeFilter.SHOW_TEXT);
-        let charCount = 0;
-        let startOffset = 0, endOffset = 0;
+        let charCount = 0, startOffset = 0, endOffset = 0;
         while (walker.nextNode()) {
           const node = walker.currentNode;
           if (node === pendingRange.startContainer) startOffset = charCount + pendingRange.startOffset;
@@ -296,26 +373,22 @@
           charCount += node.nodeValue.length;
         }
 
-        sel.removeAllRanges();
+        window.getSelection().removeAllRanges();
+        pendingRange = null;
 
         const comment = {
-          id: crypto.randomUUID(),
-          prUrl,
+          id: crypto.randomUUID(), // temporary until GitHub assigns real ID
+          githubCommentId: null,
           quote: selectedText,
           elementXPath: xpath,
           startOffset,
           endOffset,
           commentText: '',
           timestamp: Date.now(),
+          author: document.querySelector('meta[name="user-login"]')?.content || 'you',
+          avatarUrl: '',
         };
         addComment(comment);
-        pendingRange = null;
-
-        // Focus the new card's textarea
-        setTimeout(() => {
-          const card = sidebarList.querySelector(`.prmc-comment-card[data-comment-id="${comment.id}"]`);
-          if (card) card.querySelector('textarea').focus();
-        }, 50);
       });
       document.body.appendChild(addBtn);
     }
@@ -330,58 +403,47 @@
 
   // ── Init rich diff layer ───────────────────────────────────────────────────
 
-  function initCommentLayer(article) {
-    // Load and apply existing highlights; show open button only if there are comments
-    loadComments(all => {
-      renderSidebar(all);
-      pageComments(all).forEach(applyHighlight);
-      if (pageComments(all).length > 0) {
-        openBtn.classList.remove('prmc-hidden');
-      }
-    });
+  async function initCommentLayer(article) {
+    try {
+      activeComments = await fetchPageComments();
+    } catch (e) {
+      console.warn('[prmc] Could not load comments from GitHub API:', e);
+      activeComments = [];
+    }
 
-    // Listen for text selection within the article
-    document.addEventListener('mouseup', (e) => {
-      // Small delay so the selection is finalized
+    renderSidebar(activeComments);
+    activeComments.forEach(applyHighlight);
+    if (activeComments.length > 0) openBtn.classList.remove('prmc-hidden');
+
+    document.addEventListener('mouseup', () => {
       setTimeout(() => {
         const sel = window.getSelection();
-        if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-          hideAddBtn();
-          return;
-        }
+        if (!sel || sel.isCollapsed || !sel.toString().trim()) { hideAddBtn(); return; }
         const range = sel.getRangeAt(0);
-        // Check selection is inside the rich diff article
-        if (!article.contains(range.commonAncestorContainer)) {
-          hideAddBtn();
-          return;
-        }
+        if (!article.contains(range.commonAncestorContainer)) { hideAddBtn(); return; }
         pendingRange = range.cloneRange();
         const rect = range.getBoundingClientRect();
         showAddBtn(rect.right + window.scrollX + 6, rect.top + window.scrollY - 4);
       }, 10);
     });
 
-    // Hide button when clicking elsewhere
     document.addEventListener('mousedown', (e) => {
-      if (addBtn && e.target !== addBtn) {
-        hideAddBtn();
-      }
+      if (addBtn && e.target !== addBtn) hideAddBtn();
     });
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   function bootstrap() {
+    if (!prInfo) return; // not a PR page
     buildSidebar();
 
-    // Check if rich diff is already present
     const existing = document.querySelector('article.markdown-body.entry-content');
     if (existing && !existing.dataset.commentEnabled) {
       existing.dataset.commentEnabled = 'true';
       initCommentLayer(existing);
     }
 
-    // Watch for rich diff being toggled on dynamically
     const observer = new MutationObserver(() => {
       const article = document.querySelector('article.markdown-body.entry-content');
       if (article && !article.dataset.commentEnabled) {

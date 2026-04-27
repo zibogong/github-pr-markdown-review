@@ -117,6 +117,39 @@
   background: #f6f8fa;
 }
 
+.prmc-comment-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 0;
+}
+
+.prmc-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.prmc-author {
+  font-size: 12px;
+  font-weight: 600;
+  color: #24292f;
+  text-decoration: none;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prmc-author:hover { text-decoration: underline; }
+
+.prmc-date {
+  font-size: 11px;
+  color: #57606a;
+  flex-shrink: 0;
+}
+
 .prmc-comment-footer {
   display: flex;
   align-items: center;
@@ -124,6 +157,12 @@
   padding: 4px 8px 6px;
   font-size: 11px;
   color: #57606a;
+}
+
+.prmc-save-status {
+  font-size: 11px;
+  color: #57606a;
+  font-style: italic;
 }
 
 .prmc-comment-delete {

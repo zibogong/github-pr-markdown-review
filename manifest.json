@@ -4,6 +4,10 @@
   "version": "1.0.0",
   "description": "Select text in GitHub PR rich diffs and add inline comments, Google Docs-style.",
   "permissions": ["storage"],
+  "host_permissions": [
+    "https://github.com/*/*/pull/*",
+    "https://api.github.com/*"
+  ],
   "content_scripts": [
     {
       "matches": ["https://github.com/*/*/pull/*"],
