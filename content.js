@@ -11,29 +11,16 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
-  // All API calls go through the background worker which holds the OAuth token.
-  function ghFetch(method, path, body) {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, result => {
-        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-        if (result?._error) {
-          const err = new Error(result._error);
-          err.code = result._code;
-          return reject(err);
-        }
-        resolve(result);
-      });
-    });
-  }
+  // ── GitHub integration — no token needed ──────────────────────────────────
+  //
+  // Writes: POST to github.com using the CSRF token already on the page +
+  //         the user's existing session cookie. Identical to clicking Submit
+  //         on GitHub's own comment form.
+  //
+  // Reads:  GET from api.github.com — no auth required for public repos.
 
-  function launchOAuth() {
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: 'launch_oauth' }, result => {
-        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-        if (result?._error) return reject(Object.assign(new Error(result._error), { code: result._code }));
-        resolve();
-      });
-    });
+  function getCsrfToken() {
+    return document.querySelector('meta[name="csrf-token"]')?.content;
   }
 
   function buildCommentBody(comment) {
@@ -73,32 +60,77 @@
     } catch { return null; }
   }
 
+  // Read: unauthenticated, works for any public repo
   async function fetchPageComments() {
     if (!prInfo) return [];
     const { owner, repo, number } = prInfo;
-    const data = await ghFetch('GET', `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`);
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
+      { headers: { 'Accept': 'application/vnd.github+json' } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
     return data.filter(c => c.body.includes(MARKER)).map(parseGitHubComment).filter(Boolean);
   }
 
+  // Write: same-origin form POST — session cookie + CSRF token, exactly like
+  // GitHub's own Submit button. Returns the new GitHub comment ID.
   async function postComment(comment) {
     const { owner, repo, number } = prInfo;
-    const res = await ghFetch('POST', `/repos/${owner}/${repo}/issues/${number}/comments`, {
-      body: buildCommentBody(comment),
+    const csrf = getCsrfToken();
+    if (!csrf) throw new Error('CSRF token not found — are you logged in to GitHub?');
+
+    const res = await fetch(`https://github.com/${owner}/${repo}/issues/${number}/comments`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: new URLSearchParams({
+        authenticity_token: csrf,
+        'comment[body]': buildCommentBody(comment),
+      }),
     });
-    return res.id;
+
+    if (!res.ok) throw new Error(`Comment POST failed: ${res.status}`);
+
+    // Try to get ID from JSON response
+    try {
+      const data = await res.json();
+      if (data.id) return data.id;
+    } catch {}
+
+    // Fallback: scan GitHub API for the comment we just created
+    await new Promise(r => setTimeout(r, 1200));
+    const fresh = await fetchPageComments();
+    const match = fresh.find(c =>
+      c.quote === comment.quote &&
+      Date.now() - c.timestamp < 15_000
+    );
+    return match?.githubCommentId ?? null;
   }
 
-  async function patchComment(githubCommentId, comment) {
-    const { owner, repo } = prInfo;
-    await ghFetch('PATCH', `/repos/${owner}/${repo}/issues/comments/${githubCommentId}`, {
-      body: buildCommentBody(comment),
-    });
-  }
-
+  // Delete: use GitHub's comment-delete endpoint (same-origin, CSRF auth)
   async function deleteGhComment(githubCommentId) {
+    if (!githubCommentId) return;
     const { owner, repo } = prInfo;
-    await ghFetch('DELETE', `/repos/${owner}/${repo}/issues/comments/${githubCommentId}`);
+    const csrf = getCsrfToken();
+    // GitHub's web UI deletes via a DELETE request to the comment URL
+    await fetch(`https://github.com/${owner}/${repo}/issues/comments/${githubCommentId}`, {
+      method: 'DELETE',
+      credentials: 'include',
+      headers: {
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRF-Token': csrf,
+      },
+    });
   }
+
+  // No-op: editing via browser form is complex; updates stay local only
+  async function patchComment(_id, _comment) {}
 
   // ── In-memory state ────────────────────────────────────────────────────────
 
@@ -322,53 +354,9 @@
         if (card) card.querySelector('textarea').focus();
       }, 50);
     } catch (e) {
-      if (e.code === 'no_token' || e.code === 'invalid_token') {
-        showLoginPrompt(e.code === 'invalid_token' ? e.message : null, comment);
-      } else if (e.code === 'not_configured') {
-        showError('Set CLIENT_ID and CLIENT_SECRET in background.js first (see setup instructions).');
-      } else {
-        console.error('[prmc] Failed to post comment:', e);
-        showError('Could not post comment: ' + e.message);
-      }
+      console.error('[prmc] Failed to post comment:', e);
+      showError(e.message || 'Could not post comment');
     }
-  }
-
-  function showLoginPrompt(errorMsg, pendingComment) {
-    if (document.getElementById('prmc-token-modal')) return;
-
-    const overlay = document.createElement('div');
-    overlay.id = 'prmc-token-modal';
-    overlay.innerHTML = `
-      <div id="prmc-token-dialog">
-        <h3>Connect GitHub</h3>
-        ${errorMsg ? `<p class="prmc-token-error">${escapeHtml(errorMsg)}</p>` : ''}
-        <p>Sign in once to post and view comments from all reviewers.</p>
-        <button id="prmc-oauth-btn">
-          <svg width="16" height="16" viewBox="0 0 16 16" style="vertical-align:middle;margin-right:6px" fill="currentColor">
-            <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-          </svg>
-          Login with GitHub
-        </button>
-        <button id="prmc-token-cancel">Cancel</button>
-      </div>`;
-    document.body.appendChild(overlay);
-
-    overlay.querySelector('#prmc-oauth-btn').addEventListener('click', async () => {
-      const btn = overlay.querySelector('#prmc-oauth-btn');
-      btn.disabled = true;
-      btn.textContent = 'Opening GitHub…';
-      try {
-        await launchOAuth();
-        overlay.remove();
-        if (pendingComment) addComment(pendingComment);
-      } catch (e) {
-        showError('Login failed: ' + e.message);
-        overlay.remove();
-      }
-    });
-
-    overlay.querySelector('#prmc-token-cancel').addEventListener('click', () => overlay.remove());
-    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
   }
 
   async function removeComment(comment) {
