@@ -97,24 +97,19 @@
   color: #82071e;
 }
 
-.prmc-comment-body {
-  width: 100%;
-  box-sizing: border-box;
-  border: none;
+.prmc-comment-text {
   border-top: 1px solid #d0d7de;
   padding: 6px 8px;
   font-size: 12px;
-  font-family: inherit;
-  resize: vertical;
-  min-height: 56px;
-  outline: none;
-  background: transparent;
   color: #24292f;
+  min-height: 28px;
+  white-space: pre-wrap;
+  word-break: break-word;
   border-radius: 0 0 4px 4px;
 }
 
-.prmc-comment-body:focus {
-  background: #f6f8fa;
+.prmc-comment-card.prmc-posting {
+  opacity: 0.65;
 }
 
 .prmc-comment-meta {

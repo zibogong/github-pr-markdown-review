@@ -20,26 +20,23 @@
   // Reads:  GET from api.github.com — no auth required for public repos.
 
   function getCsrfToken() {
-    // GitHub puts the CSRF token in several places depending on the page state.
-    // Try them all, most specific first.
     return (
       document.querySelector('meta[name="csrf-token"]')?.content ||
       document.querySelector('meta[name="user-csrf-token"]')?.content ||
       document.querySelector('input[name="authenticity_token"]')?.value ||
       document.querySelector('[data-csrf]')?.dataset.csrf ||
       document.querySelector('[data-authenticity-token]')?.dataset.authenticityToken ||
-      // Inline review comment forms on the Files tab always have one
       document.querySelector('form[action*="comments"] input[name="authenticity_token"]')?.value
     );
   }
 
-  // Log which token source we find so we can debug if it's still missing.
   function getVerifiedCsrfToken() {
     const token = getCsrfToken();
     if (!token) {
-      // Dump all meta names to the console to help diagnose
       const metas = [...document.querySelectorAll('meta[name]')].map(m => m.name).join(', ');
       console.warn('[prmc] CSRF token not found. Meta tags on page:', metas);
+    } else {
+      console.debug('[prmc] CSRF token found, length:', token.length);
     }
     return token;
   }
@@ -51,17 +48,20 @@
       startOffset: comment.startOffset,
       endOffset: comment.endOffset,
     });
+    // Escape --> inside the JSON so it can't accidentally close the HTML comment
+    const safeJson = meta.replace(/-->/g, '--\\>');
     const quoteLine = comment.quote
       ? `> ${comment.quote.slice(0, 300).replace(/\n/g, '\n> ')}\n\n`
       : '';
-    return `${quoteLine}${comment.commentText || ''}\n\n${MARKER}${meta} -->`;
+    return `${quoteLine}${comment.commentText || ''}\n\n${MARKER}${safeJson} -->`;
   }
 
   function parseGitHubComment(c) {
     const metaMatch = c.body.match(/<!-- prmc:(\{.*?\}) -->/s);
     if (!metaMatch) return null;
     try {
-      const meta = JSON.parse(metaMatch[1]);
+      const rawJson = metaMatch[1].replace(/--\\>/g, '-->');
+      const meta = JSON.parse(rawJson);
       const commentText = c.body
         .replace(/\n\n<!-- prmc:.*? -->/s, '')
         .replace(/^(> [^\n]*\n)+\n/, '')
@@ -81,7 +81,6 @@
     } catch { return null; }
   }
 
-  // Read: unauthenticated, works for any public repo
   async function fetchPageComments() {
     if (!prInfo) return [];
     const { owner, repo, number } = prInfo;
@@ -94,64 +93,105 @@
     return data.filter(c => c.body.includes(MARKER)).map(parseGitHubComment).filter(Boolean);
   }
 
-  // Write: same-origin form POST — session cookie + CSRF token, exactly like
-  // GitHub's own Submit button. Returns the new GitHub comment ID.
+  // Post via a real form.submit() into a hidden iframe — the only way to send
+  // SameSite=Strict session cookies from an extension content script.
   async function postComment(comment) {
     const { owner, repo, number } = prInfo;
     const csrf = getVerifiedCsrfToken();
     if (!csrf) throw new Error('CSRF token not found — are you logged in to GitHub?');
 
-    const res = await fetch(`https://github.com/${owner}/${repo}/issues/${number}/comments`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-      },
-      body: new URLSearchParams({
-        authenticity_token: csrf,
-        'comment[body]': buildCommentBody(comment),
-      }),
+    const frameName = 'prmc-frame-' + Math.random().toString(36).slice(2);
+    const iframe = Object.assign(document.createElement('iframe'), { name: frameName });
+    iframe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none';
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = `https://github.com/${owner}/${repo}/issues/${number}/comments`;
+    form.target = frameName;
+    form.style.display = 'none';
+
+    for (const [name, value] of [
+      ['utf8', '✓'],
+      ['authenticity_token', csrf],
+      ['comment[body]', buildCommentBody(comment)],
+    ]) {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    }
+
+    // Append iframe first so it's a valid target frame, then add load listener,
+    // then submit form (avoids about:blank load-event race on some browsers).
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (fn) => (...args) => { if (!settled) { settled = true; fn(...args); } };
+      const timeout = setTimeout(done(reject.bind(null, new Error('Comment submission timed out'))), 12_000);
+      iframe.addEventListener('load', done(() => { clearTimeout(timeout); resolve(); }), { once: true });
+      form.submit();
     });
 
-    if (!res.ok) throw new Error(`Comment POST failed: ${res.status}`);
+    form.remove();
+    iframe.remove();
 
-    // Try to get ID from JSON response
-    try {
-      const data = await res.json();
-      if (data.id) return data.id;
-    } catch {}
-
-    // Fallback: scan GitHub API for the comment we just created
-    await new Promise(r => setTimeout(r, 1200));
-    const fresh = await fetchPageComments();
-    const match = fresh.find(c =>
-      c.quote === comment.quote &&
-      Date.now() - c.timestamp < 15_000
-    );
-    return match?.githubCommentId ?? null;
+    // Poll api.github.com until our new comment appears (up to ~5s)
+    const posted = Date.now();
+    for (let attempt = 0; attempt < 6; attempt++) {
+      await new Promise(r => setTimeout(r, 900));
+      const fresh = await fetchPageComments();
+      const match = fresh.find(c =>
+        c.quote === comment.quote &&
+        c.elementXPath === comment.elementXPath &&
+        c.timestamp >= posted - 5000
+      );
+      if (match) return match;
+    }
+    return null;
   }
 
-  // Delete: use GitHub's comment-delete endpoint (same-origin, CSRF auth)
   async function deleteGhComment(githubCommentId) {
     if (!githubCommentId) return;
     const { owner, repo } = prInfo;
     const csrf = getVerifiedCsrfToken();
-    // GitHub's web UI deletes via a DELETE request to the comment URL
-    await fetch(`https://github.com/${owner}/${repo}/issues/comments/${githubCommentId}`, {
-      method: 'DELETE',
-      credentials: 'include',
-      headers: {
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest',
-        'X-CSRF-Token': csrf,
-      },
-    });
-  }
+    if (!csrf) return;
 
-  // No-op: editing via browser form is complex; updates stay local only
-  async function patchComment(_id, _comment) {}
+    const frameName = 'prmc-del-' + Math.random().toString(36).slice(2);
+    const iframe = Object.assign(document.createElement('iframe'), { name: frameName });
+    iframe.style.cssText = 'position:fixed;width:0;height:0;opacity:0;pointer-events:none';
+
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = `https://github.com/${owner}/${repo}/issues/comments/${githubCommentId}`;
+    form.target = frameName;
+    form.style.display = 'none';
+
+    for (const [name, value] of [
+      ['utf8', '✓'],
+      ['authenticity_token', csrf],
+      ['_method', 'delete'],
+    ]) {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    }
+
+    document.body.appendChild(iframe);
+    document.body.appendChild(form);
+    await new Promise(resolve => {
+      let done = false;
+      iframe.addEventListener('load', () => { if (!done) { done = true; resolve(); } }, { once: true });
+      setTimeout(() => { if (!done) { done = true; resolve(); } }, 6000);
+      form.submit();
+    });
+    form.remove();
+    iframe.remove();
+  }
 
   // ── In-memory state ────────────────────────────────────────────────────────
 
@@ -188,6 +228,15 @@
   function escapeHtml(str) {
     return String(str)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function currentUserLogin() {
+    return document.querySelector('meta[name="user-login"]')?.content || '';
+  }
+
+  function currentUserAvatar() {
+    const login = currentUserLogin();
+    return login ? `https://github.com/${login}.png?size=40` : '';
   }
 
   // ── Sidebar ────────────────────────────────────────────────────────────────
@@ -245,8 +294,6 @@
     sorted.forEach(c => sidebarList.appendChild(buildCard(c)));
   }
 
-  const updateTimers = {};
-
   function buildCard(comment) {
     const card = document.createElement('div');
     card.className = 'prmc-comment-card';
@@ -258,39 +305,21 @@
 
     card.innerHTML = `
       <div class="prmc-comment-meta">
-        <img class="prmc-avatar" src="${escapeHtml(comment.avatarUrl)}" alt="">
+        <img class="prmc-avatar" src="${escapeHtml(comment.avatarUrl || currentUserAvatar())}" alt="">
         <a class="prmc-author" href="https://github.com/${escapeHtml(comment.author)}" target="_blank">${escapeHtml(comment.author)}</a>
         <span class="prmc-date">${formatDate(comment.timestamp)}</span>
       </div>
       <div class="${quoteClass}" title="${escapeHtml(comment.quote)}">${escapeHtml(quoteText.slice(0, 120))}</div>
-      <textarea class="prmc-comment-body" placeholder="Add a comment…">${escapeHtml(comment.commentText || '')}</textarea>
+      <div class="prmc-comment-text">${escapeHtml(comment.commentText || '')}</div>
       <div class="prmc-comment-footer">
         <span class="prmc-save-status"></span>
         <button class="prmc-comment-delete">Delete</button>
       </div>`;
 
-    const textarea = card.querySelector('.prmc-comment-body');
-    const statusEl = card.querySelector('.prmc-save-status');
-
-    textarea.addEventListener('input', () => {
-      clearTimeout(updateTimers[comment.id]);
-      statusEl.textContent = 'Saving…';
-      updateTimers[comment.id] = setTimeout(async () => {
-        comment.commentText = textarea.value;
-        try {
-          await patchComment(comment.githubCommentId, comment);
-          statusEl.textContent = 'Saved';
-          setTimeout(() => { statusEl.textContent = ''; }, 2000);
-        } catch {
-          statusEl.textContent = 'Save failed';
-        }
-      }, 1000);
-    });
-
     card.querySelector('.prmc-comment-delete').addEventListener('click', () => removeComment(comment));
 
     card.addEventListener('click', (e) => {
-      if (e.target.classList.contains('prmc-comment-delete') || e.target.tagName === 'TEXTAREA') return;
+      if (e.target.classList.contains('prmc-comment-delete')) return;
       const mark = document.querySelector(`mark.prmc-highlight[data-comment-id="${comment.id}"]`);
       if (mark) {
         mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -299,6 +328,19 @@
       }
     });
 
+    return card;
+  }
+
+  function buildPostingCard(quote) {
+    const card = document.createElement('div');
+    card.className = 'prmc-comment-card prmc-posting';
+    card.innerHTML = `
+      <div class="prmc-comment-meta" style="padding:8px 8px 4px">
+        <img class="prmc-avatar" src="${escapeHtml(currentUserAvatar())}" alt="">
+        <span class="prmc-author">${escapeHtml(currentUserLogin() || 'you')}</span>
+      </div>
+      <div class="prmc-comment-quote">${escapeHtml(quote.slice(0, 120))}</div>
+      <div style="padding:6px 8px 8px;font-size:12px;color:#57606a;font-style:italic">Posting to GitHub…</div>`;
     return card;
   }
 
@@ -336,7 +378,7 @@
       const mark = document.createElement('mark');
       mark.className = 'prmc-highlight';
       mark.dataset.commentId = comment.id;
-      mark.title = comment.commentText || '';
+      mark.title = comment.commentText || comment.quote;
       mark.addEventListener('click', () => {
         openSidebar();
         const card = sidebarList.querySelector(`.prmc-comment-card[data-comment-id="${comment.id}"]`);
@@ -347,7 +389,7 @@
         }
       });
       range.surroundContents(mark);
-    } catch { /* range spans elements — sidebar still shows the comment */ }
+    } catch { /* range spans multiple elements — highlight not possible, sidebar still shows it */ }
   }
 
   function removeHighlight(commentId) {
@@ -361,20 +403,26 @@
   // ── Comment CRUD ───────────────────────────────────────────────────────────
 
   async function addComment(comment) {
+    openBtn.classList.remove('prmc-hidden');
+    openSidebar();
+
+    const postingCard = buildPostingCard(comment.quote);
+    sidebarList.prepend(postingCard);
+
     try {
-      const githubId = await postComment(comment);
-      comment.id = String(githubId);
-      comment.githubCommentId = githubId;
-      activeComments.push(comment);
-      applyHighlight(comment);
+      const posted = await postComment(comment);
+      postingCard.remove();
+
+      if (!posted) {
+        throw new Error('Comment may not have been saved — could not confirm with GitHub. Check the PR conversation tab.');
+      }
+
+      activeComments.push(posted);
+      applyHighlight(posted);
       renderSidebar(activeComments);
-      openBtn.classList.remove('prmc-hidden');
-      openSidebar();
-      setTimeout(() => {
-        const card = sidebarList.querySelector(`.prmc-comment-card[data-comment-id="${comment.id}"]`);
-        if (card) card.querySelector('textarea').focus();
-      }, 50);
     } catch (e) {
+      postingCard.remove();
+      renderSidebar(activeComments);
       console.error('[prmc] Failed to post comment:', e);
       showError(e.message || 'Could not post comment');
     }
@@ -394,10 +442,83 @@
 
   function showError(msg) {
     const el = document.createElement('div');
-    el.style.cssText = 'position:fixed;bottom:16px;right:16px;background:#cf222e;color:#fff;padding:10px 14px;border-radius:6px;font-size:13px;z-index:99999;font-family:sans-serif';
+    el.style.cssText = 'position:fixed;bottom:16px;right:320px;background:#cf222e;color:#fff;padding:10px 14px;border-radius:6px;font-size:13px;z-index:99999;font-family:sans-serif;max-width:360px;line-height:1.4';
     el.textContent = msg;
     document.body.appendChild(el);
-    setTimeout(() => el.remove(), 5000);
+    setTimeout(() => el.remove(), 8000);
+  }
+
+  // ── Inline comment editor ──────────────────────────────────────────────────
+
+  function showCommentEditor(anchorRect, commentData) {
+    const existing = document.getElementById('prmc-editor');
+    if (existing) existing.remove();
+
+    const editor = document.createElement('div');
+    editor.id = 'prmc-editor';
+
+    const left = Math.min(anchorRect.left + window.scrollX, window.innerWidth - 310);
+    const top = anchorRect.bottom + window.scrollY + 8;
+
+    editor.style.cssText = `position:absolute;left:${left}px;top:${top}px;background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:10px;z-index:10001;box-shadow:0 4px 16px rgba(0,0,0,0.18);width:290px`;
+
+    editor.innerHTML = `
+      <div style="font-size:11px;color:#57606a;margin-bottom:8px;border-left:3px solid #FFD700;padding-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(commentData.quote.slice(0, 80))}</div>
+      <textarea id="prmc-editor-text" placeholder="Add a comment…" style="width:100%;box-sizing:border-box;height:80px;border:1px solid #d0d7de;border-radius:4px;padding:6px 8px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;resize:vertical;outline:none;color:#24292f"></textarea>
+      <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:8px">
+        <button id="prmc-editor-cancel" style="background:#f6f8fa;border:1px solid #d0d7de;border-radius:4px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit">Cancel</button>
+        <button id="prmc-editor-post" style="background:#0969da;color:#fff;border:none;border-radius:4px;padding:5px 12px;font-size:12px;cursor:pointer;font-family:inherit;font-weight:500">Post comment</button>
+      </div>`;
+
+    document.body.appendChild(editor);
+
+    const textarea = editor.querySelector('#prmc-editor-text');
+    textarea.focus();
+
+    editor.querySelector('#prmc-editor-cancel').addEventListener('click', () => {
+      editor.remove();
+      window.getSelection().removeAllRanges();
+      pendingRange = null;
+    });
+
+    const doPost = () => {
+      const text = textarea.value.trim();
+      editor.remove();
+      window.getSelection().removeAllRanges();
+      pendingRange = null;
+
+      addComment({
+        id: crypto.randomUUID(),
+        githubCommentId: null,
+        quote: commentData.quote,
+        elementXPath: commentData.elementXPath,
+        startOffset: commentData.startOffset,
+        endOffset: commentData.endOffset,
+        commentText: text,
+        timestamp: Date.now(),
+        author: currentUserLogin() || 'you',
+        avatarUrl: currentUserAvatar(),
+      });
+    };
+
+    editor.querySelector('#prmc-editor-post').addEventListener('click', doPost);
+
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) doPost();
+      if (e.key === 'Escape') { editor.remove(); pendingRange = null; }
+    });
+
+    // Close on outside click (delayed so the button click that opened it doesn't immediately close it)
+    setTimeout(() => {
+      const closeOnOutside = (e) => {
+        if (!editor.contains(e.target) && e.target !== addBtn) {
+          editor.remove();
+          pendingRange = null;
+          document.removeEventListener('mousedown', closeOnOutside);
+        }
+      };
+      document.addEventListener('mousedown', closeOnOutside);
+    }, 150);
   }
 
   // ── Floating "Add comment" button ──────────────────────────────────────────
@@ -412,11 +533,10 @@
       addBtn.textContent = '💬 Comment';
       addBtn.addEventListener('mousedown', e => e.preventDefault());
       addBtn.addEventListener('click', () => {
-        hideAddBtn();
-        if (!pendingRange) return;
+        if (!pendingRange) { hideAddBtn(); return; }
 
         const selectedText = pendingRange.toString().trim();
-        if (!selectedText) return;
+        if (!selectedText) { hideAddBtn(); return; }
 
         const anchorNode = pendingRange.commonAncestorContainer;
         const anchorEl = anchorNode.nodeType === Node.TEXT_NODE ? anchorNode.parentNode : anchorNode;
@@ -431,22 +551,15 @@
           charCount += node.nodeValue.length;
         }
 
-        window.getSelection().removeAllRanges();
-        pendingRange = null;
+        const rect = pendingRange.getBoundingClientRect();
+        hideAddBtn();
 
-        const comment = {
-          id: crypto.randomUUID(), // temporary until GitHub assigns real ID
-          githubCommentId: null,
+        showCommentEditor(rect, {
           quote: selectedText,
           elementXPath: xpath,
           startOffset,
           endOffset,
-          commentText: '',
-          timestamp: Date.now(),
-          author: document.querySelector('meta[name="user-login"]')?.content || 'you',
-          avatarUrl: '',
-        };
-        addComment(comment);
+        });
       });
       document.body.appendChild(addBtn);
     }
@@ -486,14 +599,16 @@
     });
 
     document.addEventListener('mousedown', (e) => {
-      if (addBtn && e.target !== addBtn) hideAddBtn();
+      if (addBtn && e.target !== addBtn && !document.getElementById('prmc-editor')?.contains(e.target)) {
+        hideAddBtn();
+      }
     });
   }
 
   // ── Bootstrap ──────────────────────────────────────────────────────────────
 
   function bootstrap() {
-    if (!prInfo) return; // not a PR page
+    if (!prInfo) return;
     buildSidebar();
 
     const existing = document.querySelector('article.markdown-body.entry-content');
