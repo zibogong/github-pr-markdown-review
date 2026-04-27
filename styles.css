@@ -226,6 +226,99 @@
   display: none;
 }
 
+/* ── Token prompt modal ──────────────────────────────────────────────────── */
+#prmc-token-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+#prmc-token-dialog {
+  background: #fff;
+  border-radius: 8px;
+  padding: 20px 24px;
+  width: 400px;
+  max-width: calc(100vw - 32px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+}
+
+#prmc-token-dialog h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  color: #24292f;
+}
+
+#prmc-token-dialog p {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #57606a;
+  line-height: 1.5;
+}
+
+#prmc-token-dialog a { color: #0969da; }
+
+#prmc-token-dialog code {
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  border-radius: 3px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+
+.prmc-token-error {
+  color: #cf222e !important;
+  font-weight: 500;
+}
+
+#prmc-token-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: monospace;
+  outline: none;
+  margin-bottom: 14px;
+}
+
+#prmc-token-input:focus { border-color: #0969da; box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.15); }
+
+#prmc-token-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+#prmc-token-buttons button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+#prmc-token-cancel {
+  background: #f6f8fa;
+  border: 1px solid #d0d7de;
+  color: #24292f;
+}
+
+#prmc-token-cancel:hover { background: #e9ebec; }
+
+#prmc-token-save {
+  background: #1a7f37;
+  border: 1px solid rgba(31, 35, 40, 0.15);
+  color: #fff;
+}
+
+#prmc-token-save:hover { background: #1a7f37cc; }
+
 /* ── Text highlights ─────────────────────────────────────────────────────── */
 mark.prmc-highlight {
   background: rgba(255, 215, 0, 0.45);

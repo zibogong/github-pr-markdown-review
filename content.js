@@ -11,15 +11,22 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
-  // Proxy through background service worker to bypass CORS on api.github.com
   function ghFetch(method, path, body) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, (result) => {
         if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-        if (result?._error) return reject(new Error(result._error));
+        if (result?._error) {
+          const err = new Error(result._error);
+          err.code = result._code;
+          return reject(err);
+        }
         resolve(result);
       });
     });
+  }
+
+  function setToken(token) {
+    return new Promise(resolve => chrome.runtime.sendMessage({ type: 'set_token', token }, resolve));
   }
 
   function buildCommentBody(comment) {
@@ -308,9 +315,49 @@
         if (card) card.querySelector('textarea').focus();
       }, 50);
     } catch (e) {
-      console.error('[prmc] Failed to post comment:', e);
-      showError('Could not post comment. Are you logged in to GitHub?');
+      if (e.code === 'no_token' || e.code === 'invalid_token') {
+        showTokenPrompt(e.code === 'invalid_token' ? e.message : null, comment);
+      } else {
+        console.error('[prmc] Failed to post comment:', e);
+        showError('Could not post comment: ' + e.message);
+      }
     }
+  }
+
+  function showTokenPrompt(errorMsg, pendingComment) {
+    if (document.getElementById('prmc-token-modal')) return;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'prmc-token-modal';
+    overlay.innerHTML = `
+      <div id="prmc-token-dialog">
+        <h3>GitHub Token Required</h3>
+        ${errorMsg ? `<p class="prmc-token-error">${escapeHtml(errorMsg)}</p>` : ''}
+        <p>Create a <a href="https://github.com/settings/tokens/new?scopes=repo&description=PR+Markdown+Commenter" target="_blank">Personal Access Token</a> with <code>repo</code> scope, then paste it below.</p>
+        <input id="prmc-token-input" type="password" placeholder="ghp_…" autocomplete="off" spellcheck="false">
+        <div id="prmc-token-buttons">
+          <button id="prmc-token-cancel">Cancel</button>
+          <button id="prmc-token-save">Save &amp; post</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    const input = overlay.querySelector('#prmc-token-input');
+    input.focus();
+
+    overlay.querySelector('#prmc-token-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('#prmc-token-save').addEventListener('click', async () => {
+      const token = input.value.trim();
+      if (!token) { input.focus(); return; }
+      await setToken(token);
+      overlay.remove();
+      if (pendingComment) addComment(pendingComment);
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') overlay.querySelector('#prmc-token-save').click();
+      if (e.key === 'Escape') overlay.remove();
+    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
   }
 
   async function removeComment(comment) {
