@@ -11,15 +11,44 @@
   const prInfo = getPrInfo();
   const MARKER = '<!-- prmc:';
 
-  // Read the session token GitHub embeds in every page for its own API calls.
-  function getPageToken() {
-    return document.querySelector('meta[name="user-csrf-token"]')?.content;
+  // Make API calls directly from the content script so the request Origin is
+  // https://github.com — the same origin GitHub's own SPA uses. The browser
+  // includes the existing github.com session cookies automatically via
+  // credentials: 'include', so no token entry is required.
+  async function ghFetch(method, path, body) {
+    let res;
+    try {
+      res = await fetch(`https://api.github.com${path}`, {
+        method,
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+        ...(body !== undefined && { body: JSON.stringify(body) }),
+      });
+    } catch (networkErr) {
+      // CORS or network failure — fall back to stored PAT
+      return ghFetchWithToken(method, path, body);
+    }
+
+    if (res.status === 401) {
+      // Session cookies weren't accepted — try stored PAT
+      return ghFetchWithToken(method, path, body);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`GitHub API ${res.status}: ${text}`);
+    }
+    if (res.status === 204 || method === 'DELETE') return null;
+    return res.json();
   }
 
-  function ghFetch(method, path, body) {
-    const pageToken = getPageToken();
+  // Fallback: use a stored PAT (or prompt for one).
+  function ghFetchWithToken(method, path, body) {
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body, pageToken }, (result) => {
+      chrome.runtime.sendMessage({ type: 'gh_api', method, path, body }, (result) => {
         if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
         if (result?._error) {
           const err = new Error(result._error);
