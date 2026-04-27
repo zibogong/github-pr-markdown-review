@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "GitHub PR Markdown Commenter",
+  "version": "1.0.0",
+  "description": "Select text in GitHub PR rich diffs and add inline comments, Google Docs-style.",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*/*/pull/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
